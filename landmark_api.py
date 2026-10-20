@@ -1,161 +1,111 @@
-from contextlib import asynccontextmanager
-from io import BytesIO
-from pathlib import Path
-from threading import Lock
+import os
 import json
-
-import mediapipe as mp
+import logging
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from PIL import Image, ImageOps, UnidentifiedImageError
-from xgboost import XGBClassifier
+import tensorflow as tf
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List
 
+# 1. Initialize Logging Matrix
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ASL_LSTM_Sequence_API")
 
-MODEL_DIR = Path(__file__).resolve().parent / "models"
-MAX_FILE_BYTES = 10 * 1024 * 1024
+# 2. Workspace File Targets
+MODELS_DIR = "models"
+MODEL_PATH = os.path.join(MODELS_DIR, "handspell_lstm_v1.keras")
+METADATA_PATH = os.path.join(MODELS_DIR, "handspell_lstm_v1_metadata.json")
 
+# 3. Securely Load Keras Neural Network and Lookup Metadata
+if os.path.exists(MODEL_PATH) and os.path.exists(METADATA_PATH):
+    try:
+        # Load the compiled Keras sequence model weights
+        lstm_model = tf.keras.models.load_model(MODEL_PATH)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    metadata = json.loads(
-        (MODEL_DIR / "handspell_xgboost_v1_metadata.json").read_text(
-            encoding="utf-8"
-        )
-    )
+        with open(METADATA_PATH, 'r') as f:
+            metadata = json.load(f)
+        CLASSES = metadata.get("classes", [chr(i) for i in range(65, 89)])  # Fallback to A-X
+        logger.info("Successfully mounted LSTM neural network layers.")
+    except Exception as e:
+        logger.error(f"Critical error loading model assets: {str(e)}")
+        raise RuntimeError(f"Model initialization failure: {e}")
+else:
+    logger.warning("Recurrent neural weight files not found. Verify deployment copy directives.")
+    CLASSES = [chr(i) for i in range(65, 89)]
 
-    classifier = XGBClassifier()
-    classifier.load_model(
-        str(MODEL_DIR / "handspell_xgboost_v1.json")
-    )
-
-    options = mp.tasks.vision.HandLandmarkerOptions(
-        base_options=mp.tasks.BaseOptions(
-            model_asset_path=str(MODEL_DIR / "hand_landmarker.task")
-        ),
-        running_mode=mp.tasks.vision.RunningMode.IMAGE,
-        num_hands=1,
-        min_hand_detection_confidence=0.5,
-        min_hand_presence_confidence=0.5,
-    )
-
-    with mp.tasks.vision.HandLandmarker.create_from_options(
-        options
-    ) as landmarker:
-        app.state.classifier = classifier
-        app.state.landmarker = landmarker
-        app.state.letters = metadata["letters"]
-
-        # Serialize access to the shared inference objects.
-        app.state.lock = Lock()
-
-        yield
-
-
+# 4. Instantiate FastAPI
 app = FastAPI(
-    title="HandSpell — MediaPipe + XGBoost",
-    lifespan=lifespan,
+    title="ASL Time-Series Sequence Landmark API",
+    description="Real-time multi-frame LSTM inference endpoint for processing dynamic gestures.",
+    version="3.0.0"
 )
 
+# 5. Inject Global CORS Middleware Policies
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def read_rgb(contents):
-    # Same image preparation as the training notebook.
-    with Image.open(BytesIO(contents)) as original:
-        oriented = ImageOps.exif_transpose(original).convert("RGBA")
-        background = Image.new(
-            "RGBA", oriented.size, (255, 255, 255, 255)
-        )
-        image = Image.alpha_composite(
-            background, oriented
-        ).convert("RGB")
+# 6. Define Pydantic 3D Shape Validation Schemas
+class FrameData(BaseModel):
+    # Validates that a single frame contains exactly 63 tracking landmarks
+    features: List[float] = Field(..., min_items=63, max_items=63)
 
-        image.thumbnail(
-            (1024, 1024),
-            Image.Resampling.LANCZOS,
-        )
-
-        return np.array(image)
-
-
-def get_features(rgb, landmarker):
-    image = mp.Image(
-        image_format=mp.ImageFormat.SRGB,
-        data=np.ascontiguousarray(rgb),
+class VideoSequenceInput(BaseModel):
+    # Enforces a sequential matrix consisting of exactly 30 chronological frames
+    sequence: List[FrameData] = Field(
+        ...,
+        min_items=30,
+        max_items=30,
+        description="A list of 30 frames, where each frame contains 63 normalized (x,y,z) coordinate coordinates."
     )
 
-    result = landmarker.detect(image)
-
-    if not result.hand_landmarks:
-        return None
-
-    points = np.array(
-        [
-            [point.x, point.y, point.z]
-            for point in result.hand_landmarks[0]
-        ],
-        dtype=np.float32,
-    )
-
-    height, width = rgb.shape[:2]
-    points *= np.array(
-        [width, height, width],
-        dtype=np.float32,
-    )
-
-    relative = points - points[0]
-    scale = np.linalg.norm(relative[9])
-
-    if scale < 1e-6:
-        return None
-
-    return (relative / scale).reshape(1, 63)
-
-
-@app.get("/health")
-def health():
+# 7. Endpoints
+@app.get("/", status_code=status.HTTP_200_OK)
+def health_check():
+    """System heartbeat monitored by GCP Cloud Run."""
     return {
-        "status": "ok",
-        "model": "MediaPipe + XGBoost",
-        "classes": len(app.state.letters),
+        "status": "healthy",
+        "lstm_layers_loaded": 'lstm_model' in globals(),
+        "expected_sequence_shape": [30, 63]
     }
 
-
-@app.post("/predict")
-def predict(file: UploadFile = File(...)):
+@app.post("/predict", status_code=status.HTTP_200_OK)
+def predict_sequence(payload: VideoSequenceInput):
+    """Processes sequential matrices over time to identify dynamic sign gestures."""
     try:
-        contents = file.file.read(MAX_FILE_BYTES + 1)
-    finally:
-        file.file.close()
+        # Extract the coordinate floats from the incoming Pydantic nested models object
+        raw_sequence = [frame.features for frame in payload.sequence]
 
-    if not contents:
-        raise HTTPException(400, "The uploaded file is empty.")
+        # Convert list to a 3D NumPy array: (30, 63)
+        sequence_matrix = np.array(raw_sequence)
 
-    if len(contents) > MAX_FILE_BYTES:
-        raise HTTPException(413, "Maximum image size is 10 MB.")
+        # Add the batch dimension required by Keras: (1, 30, 63)
+        input_tensor = np.expand_dims(sequence_matrix, axis=0)
 
-    try:
-        rgb = read_rgb(contents)
-    except (
-        UnidentifiedImageError,
-        OSError,
-        ValueError,
-        Image.DecompressionBombError,
-    ):
-        raise HTTPException(400, "Upload a valid JPG or PNG image.")
+        # Execute forward-propagation inference matrix calculation
+        probabilities = lstm_model.predict(input_tensor, verbose=0)
 
-    with app.state.lock:
-        features = get_features(rgb, app.state.landmarker)
+        # Parse outputs
+        max_idx = int(np.argmax(probabilities[0]))
+        confidence = float(probabilities[0][max_idx])
+        predicted_gesture = CLASSES[max_idx]
 
-        if features is None:
-            raise HTTPException(
-                422,
-                "No usable hand detected. Try a clearer image.",
-            )
+        logger.info(f"Classified structural movement: '{predicted_gesture}' with {confidence*100:.2f}% confidence.")
 
-        scores = app.state.classifier.predict_proba(features)[0]
-        best_index = int(np.argmax(scores))
-        class_id = int(app.state.classifier.classes_[best_index])
+        return {
+            "prediction": predicted_gesture,
+            "confidence_score": round(confidence, 4),
+            "engine": "LSTM Recurrent Network v1"
+        }
 
-    return {
-        "prediction": app.state.letters[class_id],
-        "confidence": float(scores[best_index]),
-    }
+    except Exception as error:
+        logger.error(f"Runtime sequence inference failure: {str(error)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Inference failure processing sequential coordinates: {str(error)}"
+        )
