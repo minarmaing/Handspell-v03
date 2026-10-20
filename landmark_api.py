@@ -53,7 +53,7 @@ app.add_middleware(
 # 6. Define Pydantic 3D Shape Validation Schemas
 class FrameData(BaseModel):
     # Validates that a single frame contains exactly 63 tracking landmarks
-    features: List[float] = Field(..., min_items=63, max_items=63)
+    features: List[float] = Field(..., min_items=126, max_items=126)
 
 class VideoSequenceInput(BaseModel):
     # Enforces a sequential matrix consisting of exactly 30 chronological frames
@@ -61,7 +61,7 @@ class VideoSequenceInput(BaseModel):
         ...,
         min_items=30,
         max_items=30,
-        description="A list of 30 frames, where each frame contains 63 normalized (x,y,z) coordinate coordinates."
+        description="A list of 30 frames, where each frame contains 126 normalized (x,y,z) coordinate coordinates."
     )
 
 # 7. Endpoints
@@ -71,7 +71,7 @@ def health_check():
     return {
         "status": "healthy",
         "lstm_layers_loaded": 'lstm_model' in globals(),
-        "expected_sequence_shape": [30, 63]
+        "expected_sequence_shape": [30, 126]
     }
 
 @app.post("/predict", status_code=status.HTTP_200_OK)
@@ -80,22 +80,22 @@ def predict_sequence(payload: VideoSequenceInput):
     try:
         # 1. Extract raw coordinates array layout
         raw_sequence = [frame.features for frame in payload.sequence]
-        sequence_matrix = np.array(raw_sequence)  # Target shape: (30, 63)
+        sequence_matrix = np.array(raw_sequence)  # Target shape: (30, 126)
 
         # --- THE CORRECTIVE ALIGNMENT STEP ---
         # If your model summary expects a different feature count,
         # slice or pad the input vector to match the model's exact tensor requirement.
         # Based on the error log, the model requires 63 features as its baseline input.
-        if sequence_matrix.shape[1] != 63:
-            logger.warning(f"Reshaping incoming features from {sequence_matrix.shape[1]} to 63")
-            # Slice or pad the columns to force exactly 63 feature columns
-            if sequence_matrix.shape[1] > 63:
-                sequence_matrix = sequence_matrix[:, :63]
+        if sequence_matrix.shape[1] != 126:
+            logger.warning(f"Reshaping incoming features from {sequence_matrix.shape[1]} to 126")
+            # Slice or pad the columns to force exactly 126 feature columns
+            if sequence_matrix.shape[1] > 126:
+                sequence_matrix = sequence_matrix[:, :126]
             else:
-                padding = np.zeros((30, 63 - sequence_matrix.shape[1]))
+                padding = np.zeros((30, 126 - sequence_matrix.shape[1]))
                 sequence_matrix = np.hstack((sequence_matrix, padding))
 
-        # 2. Add the batch dimension required by Keras: (1, 30, 63)
+        # 2. Add the batch dimension required by Keras: (1, 30, 126)
         input_tensor = np.expand_dims(sequence_matrix, axis=0)
 
         # 3. Execute inference safely
