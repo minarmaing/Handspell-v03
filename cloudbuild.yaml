@@ -1,0 +1,36 @@
+steps:
+  # Step 0: Create the local models folder and download your files from the bucket root
+  - name: 'gcr.io/cloud-builders/gsutil'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        mkdir -p ./models
+        gsutil cp gs://${_BUCKET_NAME}/handspell_lstm_v1.keras ./models/
+        gsutil cp gs://${_BUCKET_NAME}/handspell_lstm_v1_metadata.json ./models/
+        echo "Successfully fetched models from bucket root:"
+        ls -la ./models/
+
+  # Step 1: Build the container image using Docker
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/handspell-landmarks-asl-api-v03', '.']
+
+  # Step 2: Push the compiled container image out to your project's Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/handspell-landmarks-asl-api-v03']
+
+  # Step 3: Deploy the container directly onto Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'handspell-landmarks-asl-api-v03'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/handspell-landmarks-asl-api-v03'
+      - '--region'
+      - 'europe-west1'
+      - '--allow-unauthenticated'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
