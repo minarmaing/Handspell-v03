@@ -78,24 +78,32 @@ def health_check():
 def predict_sequence(payload: VideoSequenceInput):
     """Processes sequential matrices over time to identify dynamic sign gestures."""
     try:
-        # Extract the coordinate floats from the incoming Pydantic nested models object
+        # 1. Extract raw coordinates array layout
         raw_sequence = [frame.features for frame in payload.sequence]
+        sequence_matrix = np.array(raw_sequence)  # Target shape: (30, 63)
 
-        # Convert list to a 3D NumPy array: (30, 63)
-        sequence_matrix = np.array(raw_sequence)
+        # --- THE CORRECTIVE ALIGNMENT STEP ---
+        # If your model summary expects a different feature count,
+        # slice or pad the input vector to match the model's exact tensor requirement.
+        # Based on the error log, the model requires 63 features as its baseline input.
+        if sequence_matrix.shape[1] != 63:
+            logger.warning(f"Reshaping incoming features from {sequence_matrix.shape[1]} to 63")
+            # Slice or pad the columns to force exactly 63 feature columns
+            if sequence_matrix.shape[1] > 63:
+                sequence_matrix = sequence_matrix[:, :63]
+            else:
+                padding = np.zeros((30, 63 - sequence_matrix.shape[1]))
+                sequence_matrix = np.hstack((sequence_matrix, padding))
 
-        # Add the batch dimension required by Keras: (1, 30, 63)
+        # 2. Add the batch dimension required by Keras: (1, 30, 63)
         input_tensor = np.expand_dims(sequence_matrix, axis=0)
 
-        # Execute forward-propagation inference matrix calculation
+        # 3. Execute inference safely
         probabilities = lstm_model.predict(input_tensor, verbose=0)
 
-        # Parse outputs
-        max_idx = int(np.argmax(probabilities[0]))
-        confidence = float(probabilities[0][max_idx])
+        max_idx = np.argmax(probabilities[0]) if len(probabilities.shape) > 1 else np.argmax(probabilities)
+        confidence = float(probabilities[0][max_idx]) if len(probabilities.shape) > 1 else float(probabilities[max_idx])
         predicted_gesture = CLASSES[max_idx]
-
-        logger.info(f"Classified structural movement: '{predicted_gesture}' with {confidence*100:.2f}% confidence.")
 
         return {
             "prediction": predicted_gesture,
